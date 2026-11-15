@@ -25,3 +25,11 @@ ENV/
 *.log
 *.sqlite3
 *.db
+
+# Deployment & Build Artifacts
+.vercel
+.netlify
+node_modules/
+dist/
+build/
+

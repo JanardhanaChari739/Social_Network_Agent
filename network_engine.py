@@ -13,8 +13,46 @@ from typing import List, Optional, Dict, Any
 from uuid import UUID, uuid4
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field, HttpUrl
-import numpy as np
+import math
+import random
+
+
+class _FieldDefinition:
+    def __init__(self, default: Any, default_factory: Any = None):
+        self.default = default
+        self.default_factory = default_factory
+
+
+def Field(default: Any = ..., *, default_factory: Any = None, **_: Any) -> _FieldDefinition:
+    return _FieldDefinition(default, default_factory)
+
+
+class BaseModel:
+    """Small schema-model fallback for environments without Pydantic."""
+
+    def __init__(self, **values: Any):
+        fields: Dict[str, Any] = {}
+        for parent in reversed(type(self).__mro__):
+            fields.update(getattr(parent, "__annotations__", {}))
+
+        unknown = values.keys() - fields.keys()
+        if unknown:
+            raise TypeError(f"Unexpected field(s): {', '.join(sorted(unknown))}")
+
+        for name in fields:
+            value = values.get(name, ...)
+            if value is ...:
+                definition = getattr(type(self), name, ...)
+                if isinstance(definition, _FieldDefinition):
+                    if definition.default_factory is not None:
+                        value = definition.default_factory()
+                    elif definition.default is not ...:
+                        value = definition.default
+                elif definition is not ...:
+                    value = definition
+            if value is ...:
+                raise TypeError(f"Missing required field: {name}")
+            setattr(self, name, value)
 
 
 # ============================================================================
@@ -72,10 +110,11 @@ class EmbeddingService:
 
     @staticmethod
     def get_embedding(text: str, dim: int = 1536) -> List[float]:
-        np.random.seed(abs(hash(text)) % (2**32))
-        vec = np.random.randn(dim).astype(np.float32)
-        norm = np.linalg.norm(vec)
-        return (vec / norm).tolist()
+        seed = int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest(), "big")
+        rng = random.Random(seed)
+        vec = [rng.gauss(0.0, 1.0) for _ in range(dim)]
+        norm = math.sqrt(sum(value * value for value in vec))
+        return [value / norm for value in vec] if norm else vec
 
 
 class RerankingService:
@@ -124,11 +163,11 @@ class MultiStageRoutingEngine:
         Computes Cosine Similarity against HNSW index and retrieves Top K.
         """
         scored_candidates = []
-        q_vec = np.array(post_embedding, dtype=np.float32)
-
         for agent in candidates:
-            a_vec = np.array(agent.interest_embedding, dtype=np.float32)
-            cosine_sim = float(np.dot(q_vec, a_vec))
+            cosine_sim = sum(
+                query_value * agent_value
+                for query_value, agent_value in zip(post_embedding, agent.interest_embedding)
+            )
             scored_candidates.append((agent, cosine_sim))
 
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
@@ -234,29 +273,35 @@ class DynamicProfileLearner:
         beta: float = 0.03,
         lambda_anchor: float = 0.20
     ) -> List[float]:
-        current_vec = np.array(agent.interest_embedding, dtype=np.float32)
+        current_vec = agent.interest_embedding
+        dimensions = len(current_vec)
 
-        pos_shift = np.zeros_like(current_vec)
-        if engaged_post_embeddings:
-            pos_shift = np.sum([np.array(e) for e in engaged_post_embeddings], axis=0) * alpha
+        pos_shift = [
+            alpha * sum(embedding[index] for embedding in engaged_post_embeddings)
+            for index in range(dimensions)
+        ]
+        neg_shift = [
+            beta * sum(embedding[index] for embedding in ignored_post_embeddings)
+            for index in range(dimensions)
+        ]
+        updated_vec = [
+            value + positive - negative
+            for value, positive, negative in zip(current_vec, pos_shift, neg_shift)
+        ]
 
-        neg_shift = np.zeros_like(current_vec)
-        if ignored_post_embeddings:
-            neg_shift = np.sum([np.array(e) for e in ignored_post_embeddings], axis=0) * beta
-
-        updated_vec = current_vec + pos_shift - neg_shift
-
-        base_manifesto_vec = np.array(
-            EmbeddingService.get_embedding(agent.interest_manifesto),
-            dtype=np.float32
+        base_manifesto_vec = EmbeddingService.get_embedding(
+            agent.interest_manifesto, dim=dimensions
         )
-        final_vec = (1.0 - lambda_anchor) * updated_vec + lambda_anchor * base_manifesto_vec
+        final_vec = [
+            (1.0 - lambda_anchor) * updated + lambda_anchor * base
+            for updated, base in zip(updated_vec, base_manifesto_vec)
+        ]
 
-        norm = np.linalg.norm(final_vec)
+        norm = math.sqrt(sum(value * value for value in final_vec))
         if norm > 0:
-            final_vec = final_vec / norm
+            final_vec = [value / norm for value in final_vec]
 
-        agent.interest_embedding = final_vec.tolist()
+        agent.interest_embedding = final_vec
         return agent.interest_embedding
 
 
